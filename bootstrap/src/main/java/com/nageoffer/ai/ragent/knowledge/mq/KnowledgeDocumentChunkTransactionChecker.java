@@ -61,6 +61,8 @@ public class KnowledgeDocumentChunkTransactionChecker implements TransactionChec
         KnowledgeDocumentDO documentDO = documentMapper.selectById(docId);
 
         return documentDO != null
-                && DocumentStatus.RUNNING.getCode().equals(documentDO.getStatus());
+                && DocumentStatus.RUNNING.getCode().equals(documentDO.getStatus())
+                && event.getDocumentVersion() != null
+                && event.getDocumentVersion().equals(documentDO.getDocumentVersion());
     }
 }
