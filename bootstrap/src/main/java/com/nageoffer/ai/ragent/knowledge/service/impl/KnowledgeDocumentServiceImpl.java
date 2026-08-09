@@ -38,7 +38,6 @@ import com.nageoffer.ai.ragent.core.ingest.IngestionKernel;
 import com.nageoffer.ai.ragent.core.ingest.IngestionOutcome;
 import com.nageoffer.ai.ragent.core.ingest.IngestionSpec;
 import com.nageoffer.ai.ragent.core.ingest.VectorTarget;
-import com.nageoffer.ai.ragent.core.ingest.sink.ChunkIndexWriter;
 import com.nageoffer.ai.ragent.core.parser.registry.ParserRegistry;
 import com.nageoffer.ai.ragent.framework.context.UserContext;
 import com.nageoffer.ai.ragent.framework.exception.ClientException;
@@ -70,6 +69,7 @@ import com.nageoffer.ai.ragent.knowledge.enums.ProcessMode;
 import com.nageoffer.ai.ragent.knowledge.enums.SourceType;
 import com.nageoffer.ai.ragent.knowledge.handler.RemoteFileFetcher;
 import com.nageoffer.ai.ragent.knowledge.mq.event.KnowledgeDocumentChunkEvent;
+import com.nageoffer.ai.ragent.knowledge.mq.event.KnowledgeDocumentCleanupEvent;
 import com.nageoffer.ai.ragent.knowledge.schedule.CronScheduleHelper;
 import com.nageoffer.ai.ragent.knowledge.schedule.DocumentStatusHelper;
 import com.nageoffer.ai.ragent.knowledge.service.KnowledgeChunkService;
@@ -104,7 +104,6 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
     private final KnowledgeDocumentMapper documentMapper;
     private final ParserRegistry parserRegistry;
     private final IngestionKernel ingestionKernel;
-    private final ChunkIndexWriter chunkIndexWriter;
     private final IngestionSpecCodec ingestionSpecCodec;
     private final FileStorageService fileStorageService;
     private final VectorStoreService vectorStoreService;
@@ -126,6 +125,9 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
 
     @Value("knowledge-document-chunk_topic${unique-name:}")
     private String chunkTopic;
+
+    @Value("knowledge-document-cleanup_topic${unique-name:}")
+    private String cleanupTopic;
 
     @Override
     @LogRecord(
@@ -416,7 +418,6 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
     }
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     @LogRecord(
             success = "删除文档：{{#bizChangeName}}",
             fail = "删除文档失败：{{#_errorMsg}}",
@@ -431,36 +432,49 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
         Assert.notNull(documentDO, () -> new ClientException("文档不存在"));
         bizChangeLogContext.putName(documentDO.getDocName());
         KnowledgeDocumentDO before = BeanUtil.copyProperties(documentDO, KnowledgeDocumentDO.class);
-
-        String deletingVersion = documentStatusHelper.tryMarkDeleting(
-                docId, documentDO.getDocumentVersion(), UserContext.getUsername());
-        if (deletingVersion == null) {
-            throw new ClientException("文档状态或版本已变化，请稍后重试");
-        }
-        documentDO.setStatus(DocumentStatus.DELETING.getCode());
-        documentDO.setDocumentVersion(deletingVersion);
-
-        scheduleService.deleteByDocId(docId);
-        chunkLogMapper.delete(Wrappers.lambdaQuery(KnowledgeDocumentChunkLogDO.class)
-                .eq(KnowledgeDocumentChunkLogDO::getDocId, docId));
-
-        int deleted = documentMapper.update(
-                Wrappers.lambdaUpdate(KnowledgeDocumentDO.class)
-                        .set(KnowledgeDocumentDO::getDeleted, 1)
-                        .set(KnowledgeDocumentDO::getUpdatedBy, UserContext.getUsername())
-                        .set(KnowledgeDocumentDO::getUpdateTime, new Date())
-                        .eq(KnowledgeDocumentDO::getId, docId)
-                        .eq(KnowledgeDocumentDO::getDeleted, 0)
-                        .eq(KnowledgeDocumentDO::getStatus, DocumentStatus.DELETING.getCode())
-                        .eq(KnowledgeDocumentDO::getDocumentVersion, deletingVersion));
-        if (deleted != 1) {
-            throw new ClientException("文档删除所有权已失效");
-        }
-
-        // 一次调用覆盖全部落点：关系库块与向量都在扇出里，未来加索引后端也自动跟随
         KnowledgeBaseDO kbDO = knowledgeBaseMapper.selectById(documentDO.getKbId());
-        chunkIndexWriter.deleteDocument(vectorTargetResolver.resolve(kbDO), documentRef(documentDO));
-        deleteStoredFileQuietly(documentDO);
+        Assert.notNull(kbDO, () -> new ClientException("知识库不存在"));
+        String collectionName = kbDO.getCollectionName();
+        String operator = UserContext.getUsername();
+        String snapshotVersion = documentDO.getDocumentVersion();
+        KnowledgeDocumentCleanupEvent event = KnowledgeDocumentCleanupEvent.builder()
+                .docId(docId)
+                .collectionName(collectionName)
+                .fileUrl(documentDO.getFileUrl())
+                .build();
+
+        // half 消息成功后执行本地事务；提交后由消费者清理 Milvus、ES、LightRAG 与对象文件
+        messageQueueProducer.sendInTransaction(
+                cleanupTopic,
+                docId,
+                "文档删除清理",
+                event,
+                ignored -> {
+                    String deletingVersion = documentStatusHelper.tryMarkDeleting(docId, snapshotVersion, operator);
+                    if (deletingVersion == null) {
+                        throw new ClientException("文档状态或版本已变化，请稍后重试");
+                    }
+
+                    int deleted = documentMapper.update(
+                            Wrappers.lambdaUpdate(KnowledgeDocumentDO.class)
+                                    .set(KnowledgeDocumentDO::getDeleted, 1)
+                                    .set(KnowledgeDocumentDO::getUpdatedBy, operator)
+                                    .set(KnowledgeDocumentDO::getUpdateTime, new Date())
+                                    .eq(KnowledgeDocumentDO::getId, docId)
+                                    .eq(KnowledgeDocumentDO::getDeleted, 0)
+                                    .eq(KnowledgeDocumentDO::getStatus, DocumentStatus.DELETING.getCode())
+                                    .eq(KnowledgeDocumentDO::getDocumentVersion, deletingVersion));
+                    if (deleted != 1) {
+                        throw new ClientException("文档删除所有权已失效");
+                    }
+
+                    scheduleService.deleteByDocId(docId);
+                    chunkLogMapper.delete(Wrappers.lambdaQuery(KnowledgeDocumentChunkLogDO.class)
+                            .eq(KnowledgeDocumentChunkLogDO::getDocId, docId));
+                    chunkMapper.delete(Wrappers.lambdaQuery(KnowledgeChunkDO.class)
+                            .eq(KnowledgeChunkDO::getDocId, docId));
+                    vectorStoreService.deleteDocumentVectorsInTransaction(collectionName, docId);
+                });
         bizChangeLogContext.put(docId, before, null);
     }
 
@@ -885,14 +899,4 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
         }
     }
 
-    private void deleteStoredFileQuietly(KnowledgeDocumentDO documentDO) {
-        if (documentDO == null || !StringUtils.hasText(documentDO.getFileUrl())) {
-            return;
-        }
-        try {
-            fileStorageService.deleteByUrl(documentDO.getFileUrl());
-        } catch (Exception e) {
-            log.warn("删除文档存储文件失败, docId={}, fileUrl={}", documentDO.getId(), documentDO.getFileUrl(), e);
-        }
-    }
 }
