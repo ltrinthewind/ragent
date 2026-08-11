@@ -1,4 +1,4 @@
--- v1.1.0 260810 文档操作统一版本
+-- v2.0.0 260810 文档操作统一版本
 
 ALTER TABLE t_knowledge_document ADD COLUMN IF NOT EXISTS document_version VARCHAR(20);
 UPDATE t_knowledge_document SET document_version = id::VARCHAR WHERE document_version IS NULL;

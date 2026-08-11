@@ -141,7 +141,7 @@ public class KnowledgeDocumentDO {
     private String status;
 
     /**
-     * 当前文档操作版本，同时作为写入 fencing token
+     * 当前文档操作版本及写入 fencing token
      */
     private String documentVersion;
 

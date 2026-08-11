@@ -745,7 +745,7 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
         String snapshotVersion = documentDO.getDocumentVersion();
         String newVersion = documentStatusHelper.nextVersion();
         transactionOperations.executeWithoutResult(status -> {
-            // CAS 更新,避免 enable 与其他操作发生并发错误
+            // CAS 更新,避免中间插入文档删除动作导致出现孤儿向量
             int updated = documentMapper.update(
                     Wrappers.lambdaUpdate(KnowledgeDocumentDO.class)
                             .set(KnowledgeDocumentDO::getEnabled, targetEnabled)
